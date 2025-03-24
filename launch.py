@@ -60,7 +60,7 @@ def main(config: DictConfig):
         step_scheduler_with_optimizer=False,
     )
 
-    if accelerator.state.fsdp_plugin is not None:
+    if hasattr(accelerator.state, "fsdp_plugin") and accelerator.state.fsdp_plugin is not None:
         accelerator.state.fsdp_plugin.transformer_layer_cls_to_wrap = config.model.block_name
 
     # Calculate microbatch sizes
@@ -94,7 +94,7 @@ def main(config: DictConfig):
                 dir=config.cache_dir,
                 name=config.exp_name,
             )
-        
+
         config_path = os.path.join(config.local_run_dir, 'config.yaml')
         with open(config_path, 'w') as f:
             OmegaConf.save(config, f)

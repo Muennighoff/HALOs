@@ -2,5 +2,5 @@ defaults:
   - base_model
 
 name_or_path: null
-block_name: QWenBlock
+block_name: Qwen2DecoderLayer
 attn_implementation: flash_attention_2

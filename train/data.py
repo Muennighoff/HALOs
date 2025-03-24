@@ -540,16 +540,7 @@ def get_ultrachat(split: str) -> Dataset:
 
 
 def get_s1k_11(split: str = "train") -> Dataset:
-    """
-    Load the Ultrafeedback (binarized) dataset from Huggingface and convert it into to a Dataset.
-    For this dataset, the SFT text is the preferred response.
-
-    Args:
-        - split: 'train'
-
-    Returns:   
-        A Dataset instance.
-    """
+    """Load s1K-1.1 dataset."""
     if split != 'train':
         split = 'train'
         print(f"Warning: s1K-1.1 only has a 'train' split but requested '{split}' split. Using 'train' split.")
@@ -571,4 +562,10 @@ def get_s1k_11(split: str = "train") -> Dataset:
         }])
         data[key].dataset_name = data.name
         data[key].sft_index = 0
+        ### Make it work with KTO in paired format ###
+        data[key].generations.append([{
+            "role": "assistant", 
+            "content": "<|im_start|>think\n" + row['gemini_thinking_trajectory'] + "\n<|im_start|>answer\n" + row['gemini_attempt']
+        }])
+        data[key].pairs.append((0, 1))
     return data

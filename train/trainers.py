@@ -297,17 +297,21 @@ class BasicTrainer(object):
 
         for batch in self.train_iterator:
             # EVALUATION
-            if self.example_counter % self.config.eval_every == 0 or (self.example_counter == 0 and self.config.do_first_eval):
+            results = None
+            if self.example_counter == 0:
+                if self.config.do_first_eval:
+                    results = self.eval()
+            elif self.example_counter % self.config.eval_every == 0:
                 results = self.eval()
 
-                if self.example_counter > 0:
-                    if self.config.debug:
-                        self.accelerator.print('skipping save in debug mode')
-                    elif self.config.intermediate_checkpoints:
-                        output_dir = os.path.join(self.run_dir, f'step-{self.example_counter}')
-                        self.accelerator.print(f'creating checkpoint to write to {output_dir}...')
-                        self.save(output_dir, results['results'], final_save=False)
+                if self.config.debug:
+                    self.accelerator.print('skipping save in debug mode')
+                elif self.config.intermediate_checkpoints:
+                    output_dir = os.path.join(self.run_dir, f'step-{self.example_counter}')
+                    self.accelerator.print(f'creating checkpoint to write to {output_dir}...')
+                    self.save(output_dir, results['results'], final_save=False)
 
+            if results is not None:
                 self.accelerator.print(results['results'])
                 delete_dicts(results)
 
@@ -332,6 +336,10 @@ class BasicTrainer(object):
                 for k, v in metrics.items():
                     batch_metrics[k].extend(torch.as_tensor(v).reshape(-1).float().cpu().numpy().tolist())
 
+                # if self.accelerator.is_main_process:
+                #     import pdb; pdb.set_trace()
+                # else:
+                #     self.accelerator.wait_for_everyone()
                 grad_norm = self.accelerator.clip_grad_norm_(self.policy.parameters(), self.config.model.max_grad_norm)
                 batch_metrics['grad_norm'].extend(torch.as_tensor(grad_norm).reshape(-1).float().cpu().numpy().tolist())
                 self.optimizer.step()
