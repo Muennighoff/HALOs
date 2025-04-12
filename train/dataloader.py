@@ -327,7 +327,7 @@ class SFTDataLoader(DataLoader):
 
     def get_num_training_steps(self):
         """Get the number of training steps."""
-        if self.n_examples:
+        if self.n_examples is not None:
             return self.n_examples // self.global_batch_size
         else:
             return int((len(self.full_data) // self.global_batch_size) * self.n_epochs)

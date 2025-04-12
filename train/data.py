@@ -569,3 +569,36 @@ def get_s1k_11(split: str = "train") -> Dataset:
         }])
         data[key].pairs.append((0, 1))
     return data
+
+
+
+def get_mathstepdpo(split: str = "train") -> Dataset:
+    """Load mathstepdpo dataset."""
+    if split != 'train':
+        split = 'train'
+        print(f"Warning: mathstepdpo only has a 'train' split but requested '{split}' split. Using 'train' split.")
+    
+    rank0_print(f'Loading xinlai/Math-Step-DPO-10K dataset ({split} split) from Huggingface...')
+    dataset = datasets.load_dataset('xinlai/Math-Step-DPO-10K', split=split)
+    if on_rank0():
+        dataset = tqdm.tqdm(dataset, desc='Processing xinlai/Math-Step-DPO-10K')
+
+    data = Dataset('mathstepdpo')
+
+    for row in dataset:
+        # Create a unique key for this example (using the question)
+        key = row['prompt']
+        data[key].prompt = [{"role": "user", "content": row['prompt']}]
+        data[key].generations.append([{
+            "role": "assistant", 
+            "content": row['initial_reason_steps'] + row['full_chosen']
+        }])
+        data[key].dataset_name = data.name
+        data[key].sft_index = 0
+        ### Make it work with KTO in paired format ###
+        data[key].generations.append([{
+            "role": "assistant", 
+            "content": row['initial_reason_steps'] + row['full_rejected']
+        }])
+        data[key].pairs.append((0, 1))
+    return data
