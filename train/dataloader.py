@@ -46,6 +46,7 @@ class DataLoader:
                  max_prompt_count: int = None,
                  n_epochs: Optional[int] = None,
                  n_examples: Optional[int] = None,
+                 num_skip: int = 0,
                  seed: int = 0,
                  control_tokens: Dict = {},
                  **kwargs):
@@ -68,10 +69,14 @@ class DataLoader:
         self.n_epochs = n_epochs
         self.epoch_idx = 0
         self.n_examples = n_examples
+        self.num_skip = num_skip
         
         self.full_data = {} # a dict of Examples
 
         for name in dataset_names:
+            if process_index == 0:
+                print(f"Loading dataset: {name}")
+                
             if hasattr(data_module, f"get_{name}"):
                 dataset = getattr(data_module, f"get_{name}")(split)
                 self.full_data.update(dataset.data)
@@ -87,10 +92,18 @@ class DataLoader:
                         else:
                             raise IOError("unrecognized data type")
                         
-                        self.full_data.update(dataset.data)
+                        for prompt_key, example in dataset.data.items():
+                            if prompt_key in self.full_data:
+                                # Adding multiple generations to the same prompt
+                                self.full_data[prompt_key].generations.extend(example.generations)
+                            else:
+                                self.full_data[prompt_key] = example
                 except:
                     raise IOError(f"could not load {name}; neither a local file or a downloadable dataset supported by train.data")
 
+        if process_index == 0:
+            print(f"Total prompts loaded: {len(self.full_data)}")
+            
         self.num_training_steps = self.get_num_training_steps()
 
     def collate(self, batch: Dict[str, List]) -> Dict:
@@ -281,25 +294,20 @@ class SFTDataLoader(DataLoader):
             batch = []
 
             for example in self.get_process_data():
-                # Assuming example.prompt is now a list of conversation turns
-                conversation = example.prompt
-                if not isinstance(conversation[0], dict):
-                    # Convert to the new format if it's not already
-                    conversation = [{"role": "user", "content": conversation[0]}]
-                    for i, message in enumerate(conversation[1:]):
-                        role = "assistant" if i % 2 == 0 else "user"
-                        conversation.append({"role": role, "content": message})
+                if self.num_skip > 0:
+                    self.num_skip -= self.num_processes
+                    continue
 
-                # Get the target generation (last turn from assistant)
-                target_generation = example.generations[example.sft_index]
+                # Get the target completion
+                completion = example.generations[example.sft_index]
 
                 # Add control token if specified
                 if self.control_tokens.get('chosen'):
-                    target_generation = self.control_tokens['chosen'] + target_generation
+                    completion[-1]['content'] = self.control_tokens['chosen'] + completion[-1]['content']
 
                 batch_element = self.tokenize_batch_element(
-                    conversation,
-                    target_generation,
+                    example.prompt,
+                    completion,
                 )
                 batch_element['original_prompt'] = example.original_prompt
                 batch_element['prompt_id'] = example.prompt_id
@@ -380,6 +388,10 @@ class ConditionalSFTDataLoader(DataLoader):
             batch = []
 
             for example, generation, status in self.get_process_data():
+                if self.num_skip > 0:
+                    self.num_skip -= self.num_processes
+                    continue
+
                 # Convert prompt to conversation format if it's not already
                 conversation = example.prompt
                 if not isinstance(conversation[0], dict):
@@ -514,6 +526,10 @@ class UnpairedPreferenceDataLoader(DataLoader):
             example_queue = []
 
             for example, generation, status, score in self.get_process_data():
+                if self.num_skip > 0:
+                    self.num_skip -= self.num_processes
+                    continue
+
                 batch_element = self.tokenize_batch_element(example.prompt, generation, prefix='target')
                 batch_element['status'] = status 
                 batch_element['conversation'] = example.prompt
@@ -711,6 +727,10 @@ class PairedPreferenceDataLoader(DataLoader):
             batch = []
 
             for example, (i, j) in self.get_process_data():
+                if self.num_skip > 0:
+                    self.num_skip -= self.num_processes
+                    continue
+
                 batch_element = {}
                 batch_element.update(self.tokenize_batch_element(example.prompt, example.generations[i], prefix='chosen'))
                 batch_element.update(self.tokenize_batch_element(example.prompt, example.generations[j], prefix='rejected'))

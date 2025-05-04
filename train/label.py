@@ -7,14 +7,18 @@ accelerate launch --config_file accelerate_config/fsdp_4gpu.yaml --main_process_
     -m train.label --reward_model_path models/llama3-8B-bt/FINAL outputs.json reward_data.json --feedback_type pairwise
 
 Sample usage for API labeling (accelerate not needed):
-accelerate launch -m train.label --api_type openai --api_key YOUR_KEY --api_model gpt-4 \
+python -m train.label --api_type openai --api_key YOUR_KEY --api_model gpt-4 \
     --label_prompt "Rate this response's quality from 0 to 1:" \
     outputs.json reward_data.json --feedback_type binary
+
+Sample usage for pairwise labeling of two sample files:
+python -m train.label --second_samples_path baseline_samples.json --api_type openai --api_key YOUR_KEY \
+    outputs.json reward_data.json --feedback_type pairwise
 """
 
 import argparse
 import json
-import os
+import numpy as np
 import torch
 import random
 from accelerate import Accelerator
@@ -27,6 +31,7 @@ from .dataloader import SFTDataLoader
 from collections import defaultdict
 import openai
 import asyncio
+import torch.distributed as dist
 
 
 def process_batch_with_reward_model(
@@ -35,13 +40,17 @@ def process_batch_with_reward_model(
     accelerator: Accelerator
 ) -> List[Dict]:
     """Process a batch through the reward model using the already tokenized sequences."""
+    
     reward_model.eval()
     with torch.no_grad():
         outputs = reward_model(
             input_ids=batch['target_combined_input_ids'],
             attention_mask=batch['target_combined_attention_mask']
         )
-        reward_scores = outputs.logits[:, 1]
+        if args.reward_model_path == "RLHFlow/ArmoRM-Llama3-8B-v0.1":
+            reward_scores = outputs.score.cpu().float()
+        else:
+            reward_scores = outputs.logits[:, 1]
     
     processed_samples = []
     for i in range(len(batch['prompt'])):
@@ -55,7 +64,10 @@ def process_batch_with_reward_model(
         processed_samples.append(sample)
     
     gathered_samples = [None] * accelerator.num_processes
-    torch.distributed.all_gather_object(gathered_samples, processed_samples)
+        
+    # Return gathered samples from all processes, not just main process
+    # This ensures samples from all processes are included
+    dist.all_gather_object(gathered_samples, processed_samples)
     
     if accelerator.is_main_process:
         return [item for sublist in gathered_samples for item in sublist]
@@ -84,7 +96,7 @@ async def process_samples_with_api(
         tasks = []
 
         for sample in batch:
-            prompt = f"{label_prompt}\n\nPrompt: {sample['prompt'][0]['content']}\nResponse: {sample['output']}"
+            prompt = f"INSTRUCTION: {sample['prompt'][0]['content']}\n\nRESPONSE: {sample['output']}\n\n{label_prompt}"
             tasks.append(get_api_completion(client, system_prompt, prompt, model))
 
         batch_scores = await asyncio.gather(*tasks)
@@ -99,29 +111,45 @@ async def process_samples_with_api(
     
     for sample, score in zip(samples, scores):
         try:
-            score = float(score)
-        except ValueError:
-            print(f"Warning: Could not parse API response as float. skipping prompt f{sample['prompt_id']}")
+            # Try to extract 'Final Score: X' from the response
+            match = re.search(r"Final Score:\s*([0-9]+(?:\.[0-9]+)?)", str(score), re.IGNORECASE)
+            if match:
+                score = float(match.group(1))
+            else:
+                # Fallback: extract first number
+                score = float(re.search(r'\d+(?:\.\d+)?', str(score)).group())
+        except Exception:
+            print(f"Warning: Could not parse API response {score} as float. skipping prompt {sample['prompt_id']}")
             continue
                 
         processed_sample = sample.copy()
         processed_sample['reward'] = score
         # since a dataloader isn't used, the output has to be explicitly formatted
-        processed_sample['output'] = [{ "role" : "assistant", "content" : processed_sample['output']}]
+        processed_sample['output'] = [{ "role" : "assistant", "content" : processed_sample['output'] }]
         processed_samples.append(processed_sample)
             
     return processed_samples
 
 
-def convert_to_binary_feedback(samples: List[Dict], threshold: float=0.5) -> List[Dict]:
+def convert_to_binary_feedback(samples: List[Dict], threshold=0) -> List[Dict]:
     """Convert samples to binary feedback format."""
     feedback = []
+
+    if threshold == 'mean':
+        rewards = [ sample['reward'] for sample in samples ]
+        threshold = np.mean(rewards)
+    elif threshold == 'median':
+        rewards = [ sample['reward'] for sample in samples ]
+        threshold = np.median(rewards)
+    else:
+        threshold = int(threshold)
+
     for sample in samples:
         feedback_item = {
             'prompt_id': sample['prompt_id'],
             'prompt': sample['prompt'],
             'output': sample['output'],
-            'label': 1 if sample['reward'] > threshold else 0,
+            'label': 1 if sample['reward'] >= threshold else 0,
             'reward': sample['reward'],
             'type': 'binary_feedback',
         }
@@ -129,7 +157,7 @@ def convert_to_binary_feedback(samples: List[Dict], threshold: float=0.5) -> Lis
     return feedback
 
 
-def convert_to_pairwise_feedback(samples: List[Dict], seed: int, threshold: float=0) -> List[Dict]:
+def convert_to_pairwise_feedback(samples: List[Dict], seed: int) -> List[Dict]:
     """Convert samples to pairwise feedback format."""
     random.seed(seed)
     
@@ -148,9 +176,6 @@ def convert_to_pairwise_feedback(samples: List[Dict], seed: int, threshold: floa
             higher_reward, lower_reward = group[i], group[i + 1]
             
             if higher_reward['reward'] == lower_reward['reward']:
-                continue
-                
-            if threshold and abs(higher_reward['reward'] - lower_reward['reward']) < threshold:
                 continue
             
             if random.random() < 0.5:
@@ -192,11 +217,13 @@ async def main(args):
             client = openai.AsyncOpenAI(api_key=args.api_key)
         else:
             raise ValueError(f"Unsupported API type: {args.api_type}")
-            
+        
         processed_samples = await process_samples_with_api(
             samples, client, args.system_prompt, args.label_prompt,
             args.api_model, args.batch_size
         )
+
+        print(f"Labelled {len(processed_samples)} samples using {args.api_type} API")
     else:
         if accelerator.is_main_process:
             print(f"Loading reward model from {args.reward_model_path}")
@@ -226,12 +253,25 @@ async def main(args):
             n_epochs=1,
             seed=args.seed
         )
+        dataloader, reward_model = accelerator.prepare(dataloader, reward_model)
+        
+        # Initialize distributed setup if not already done
+        if accelerator.num_processes > 1 and not dist.is_initialized():
+            accelerator.wait_for_everyone()
+            
+            if accelerator.is_main_process:
+                dist.init_process_group(backend='nccl')
         
         processed_samples = []
         for batch in tqdm(dataloader, disable=not accelerator.is_main_process):
             batch_samples = process_batch_with_reward_model(batch, reward_model, accelerator)
             if accelerator.is_main_process:
                 processed_samples.extend(batch_samples)
+        
+        # Wait for all processes to complete
+        accelerator.wait_for_everyone()
+
+        print(f"Labelled {len(processed_samples)} samples using {args.reward_model_path}")
 
     # Set up output writer
     if accelerator.is_main_process:
@@ -243,15 +283,19 @@ async def main(args):
             if args.feedback_type == 'binary':
                 feedback = convert_to_binary_feedback(processed_samples, threshold=args.threshold)
             elif args.feedback_type == 'pairwise':
-                feedback = convert_to_pairwise_feedback(processed_samples, args.seed, threshold=args.threshold)
+                feedback = convert_to_pairwise_feedback(processed_samples, args.seed)
             else:
                 feedback = processed_samples
                 for x in feedback:
                     x['type'] = 'scalar_feedback'
-                
+            
+            # Include split if specified
+            if args.split:
+                for x in feedback:
+                    item['split'] = args.split
+
             # Add split information and write
             for item in feedback:
-                item['split'] = args.split
                 writer.write_item(item)
             
             writer.close()
@@ -276,26 +320,17 @@ if __name__ == "__main__":
     
     # API-specific arguments
     parser.add_argument("--api_key", type=str, help="API key for the chosen API service")
-    parser.add_argument("--api_model", type=str, default="gpt-4", help="Model to use for API labeling")
-    parser.add_argument("--system_prompt", type=str, 
-                      default="You are a helpful assistant that rates the quality of responses. Provide only a number between 0 and 1.",
-                      help="System prompt for API labeling")
-    parser.add_argument("--label_prompt", type=str, 
-                     default="Rate this response's quality from 0 to 1:",
-                     help="Prompt template for API labeling")
-    
+    parser.add_argument("--api_model", type=str, default="gpt-4.1-mini", help="Model to use for API labeling")
+    parser.add_argument("--system_prompt", type=str, default="You are a helpful assistant that rates the quality of responses to given instructions.", help="System prompt for API labeling")
+    parser.add_argument("--label_prompt", type=str, default="Provide only a RATING from 0 to 10 based on how well the RESPONSE satisfied the INSTRUCTION: ", help="Prompt template for API labeling")
     # Processing arguments
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size for processing")
-    parser.add_argument("--max_length", type=int, default=1024, 
-                        help="Maximum sequence length for input")
-    parser.add_argument("--max_prompt_length", type=int, default=512, 
-                        help="Maximum prompt length for input")
-    parser.add_argument("--feedback_type", type=str, choices=['binary', 'pairwise', None], default=None,
-                        help="Type of feedback to generate")
-    parser.add_argument("--threshold", type=float, default=0,
-                        help="Reward threshold for feedback")
+    parser.add_argument("--max_length", type=int, default=2048, help="Maximum sequence length for input")
+    parser.add_argument("--max_prompt_length", type=int, default=1024, help="Maximum prompt length for input")
+    parser.add_argument("--feedback_type", type=str, choices=['binary', 'pairwise', None], default=None, help="Type of feedback to generate")
+    parser.add_argument("--threshold", type=str, default="median", help="How the reward threshold is calculated; this can also be a number (e.g., 0.5)")
     parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducibility")
-    parser.add_argument("--split", type=str, default='train', help="Split of data (train by default)")
+    parser.add_argument("--split", type=str, default=None, help="Split of data")
 
     args = parser.parse_args()
     

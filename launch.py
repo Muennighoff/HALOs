@@ -54,7 +54,6 @@ def main(config: DictConfig):
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         project_dir=config.local_run_dir,
-        gradient_accumulation_steps=config.model.gradient_accumulation_steps,
         kwargs_handlers=[ddp_kwargs],
         step_scheduler_with_optimizer=config.step_scheduler_with_optimizer,
     )
@@ -63,15 +62,15 @@ def main(config: DictConfig):
         accelerator.state.fsdp_plugin.transformer_layer_cls_to_wrap = config.model.block_name
 
     # Calculate microbatch sizes
-    if config.model.batch_size % accelerator.num_processes == 0:
-        config.model.microbatch_size = config.model.batch_size / accelerator.num_processes
+    if config.model.batch_size % (accelerator.num_processes * config.model.gradient_accumulation_steps) == 0:
+        config.model.microbatch_size = config.model.batch_size / (accelerator.num_processes * config.model.gradient_accumulation_steps)
     else:
-        raise ValueError(f"{config.model.batch_size} needs to be divisible by the number of processes")
+        raise ValueError(f"{config.model.batch_size} needs to be divisible by the number of processes * gradient_accumulation_steps")
 
-    if config.model.eval_batch_size % accelerator.num_processes == 0:
-        config.model.eval_microbatch_size = config.model.eval_batch_size / accelerator.num_processes
+    if config.model.eval_batch_size % (accelerator.num_processes * config.model.gradient_accumulation_steps) == 0:
+        config.model.eval_microbatch_size = config.model.eval_batch_size / (accelerator.num_processes * config.model.gradient_accumulation_steps)
     else:
-        raise ValueError(f"{config.model.eval_batch_size} needs to be divisible by the number of processes")
+        raise ValueError(f"{config.model.eval_batch_size} needs to be divisible by the number of processes * gradient_accumulation_steps")
 
     if config.eval_every % config.model.batch_size != 0:
         accelerator.print('WARNING: eval_every must be divisible by batch_size')
@@ -126,6 +125,12 @@ def main(config: DictConfig):
 
     num_tokens_added = tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
 
+    # only skip examples if loading from checkpoint
+    if config.model.from_checkpoint and not config.online:
+        num_skip = json.load(open(os.path.join(config.model.from_checkpoint, 'metrics.json'))).get('counter', 0)
+    else:
+        num_skip = 0
+
     # Create data loaders
     accelerator.print(f'Loading data')
     data_loader_class = getattr(dataloader, config.loss.dataloader)
@@ -146,6 +151,7 @@ def main(config: DictConfig):
         microbatch_size=config.model.microbatch_size,
         n_epochs=config.n_epochs,
         n_examples=config.n_examples,
+        num_skip=num_skip,
         **data_iterator_kwargs
     )
     eval_iterator = data_loader_class(
@@ -254,6 +260,12 @@ def main(config: DictConfig):
     # Loading optimizer, scheduler
     accelerator.print("Creating optimizer and scheduler")
     optimizer = getattr(torch.optim, config.optimizer)(policy.parameters(), lr=config.lr, weight_decay=config.weight_decay, betas=(config.beta1, config.beta2))
+    
+    # For DPOTrainer, prepare policy and optimizer across all GPUs to avoid OOM on master node
+    if config.loss.trainer == "DPOTrainer":
+        # Distribute model, optimizer, and scheduler across GPUs
+        accelerator.print("Preparing DPOTrainer components across GPUs")
+        policy, optimizer = accelerator.prepare(policy, optimizer)
 
     warmup_steps = train_iterator.num_training_steps * config.warmup
     warmup_scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
@@ -263,9 +275,9 @@ def main(config: DictConfig):
     else:
         main_scheduler = LambdaLR(optimizer, lr_lambda=lambda step: 1.0)
     
-    print(f"Total training steps: {train_iterator.num_training_steps}")
+    accelerator.print(f"Total training steps: {train_iterator.num_training_steps}")
     scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[warmup_steps])
-
+    
     if config.model.from_checkpoint:
         optimizer_state = optimizer.state_dict()
         optimizer_state.update(torch.load(os.path.join(config.model.from_checkpoint, "optimizer.pt")))
@@ -273,13 +285,7 @@ def main(config: DictConfig):
 
         scheduler_state = torch.load(os.path.join(config.model.from_checkpoint, "scheduler.pt"))
         scheduler.load_state_dict(scheduler_state)
-
-        if config.online:
-            num_skip = 0  # only resume scheduler and optimizer if doing online alignment
-        else:
-            num_skip = json.load(open(os.path.join(config.model.from_checkpoint, 'metrics.json'))).get('counter', 0)
-    else:
-        num_skip = 0
+        del optimizer_state, scheduler_state
 
     # Load explicit reward model if necessary (e.g., for PPO)
     if config.model.reward_model.path:
@@ -310,7 +316,6 @@ def main(config: DictConfig):
         reference_model=reference_model,
         reward_model=reward_model,
         reward_tokenizer=reward_tokenizer,
-        num_skip=num_skip
     )
 
     trainer.train()
