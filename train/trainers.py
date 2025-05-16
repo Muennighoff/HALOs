@@ -144,8 +144,6 @@ class BasicTrainer(object):
         Returns:
             The rejection mask (microbatch_size, sequence length)
         """
-        torch.manual_seed(self.seed)
-            
         forward_rv = torch.distributions.beta.Beta(self.config.humanline_gamma_R, self.config.humanline_beta_R)
         forward_M = (reference_logps - policy_logps).exp().max().item()
         forward_sample = forward_rv.sample(policy_logps.shape).to(self.accelerator.device)
@@ -334,6 +332,7 @@ class BasicTrainer(object):
                         loss, metrics = self.get_batch_metrics(batch)
                         loss = loss / self.config.model.gradient_accumulation_steps
                         self.accelerator.backward(loss)
+                        delete_dicts(batch)
                     
                         for k, v in metrics.items():
                             batch_metrics[k].extend(torch.as_tensor(v).reshape(-1).float().cpu().numpy().tolist())
@@ -342,7 +341,7 @@ class BasicTrainer(object):
                 batch_metrics['grad_norm'].extend(torch.as_tensor(grad_norm).reshape(-1).float().cpu().numpy().tolist())
 
                 self.optimizer.step()
-                if self.config.sync_reference or self.config.humanline or self.config.online:
+                if self.config.sync_reference or self.config.humanline:
                     self.sync_reference_with_policy()
 
             self.scheduler.step()
@@ -1101,13 +1100,14 @@ class GRPOTrainer(BasicTrainer):
             group_size
         )
 
+        metrics[f'rewards_{mode}/groupsize'] = group_size
         metrics[f'rewards_{mode}/rewards'] = scores
         metrics[f'rewards_{mode}/weighted_advantage'] = self.accelerator.gather(weighted_advantage)
         metrics[f'rewards_{mode}/KL'] = self.accelerator.gather(KL)
         metrics[f'loss/{mode}'] = self.accelerator.gather(losses.detach()).mean()
         
         del policy_logps, reference_logps, scores, prompt_ids, advantages, group_size, KL, weighted_advantage
-
+        
         return losses.mean(), metrics
 
 
@@ -1226,8 +1226,8 @@ class PPOTrainer(BasicTrainer):
             gae = delta + self.config.loss.gamma * self.config.loss.lam * gae
             advantages_reversed.append(gae)
             
-            discounted_future_rewards_reversed.append(discounted_future_reward)
             discounted_future_reward = rewards[:, t] + self.config.loss.gamma * discounted_future_reward
+            discounted_future_rewards_reversed.append(discounted_future_reward)
 
         advantages = (torch.stack(advantages_reversed[::-1]).transpose(0, 1) * masks)
         returns = (advantages + values).contiguous()
@@ -1260,7 +1260,7 @@ class PPOTrainer(BasicTrainer):
         policy_losses_clipped = -batch['advantages'] * torch.clamp(ratio, 1 - self.config.loss.cliprange, 1 + self.config.loss.cliprange)
         policy_loss = masked_mean(torch.max(policy_losses, policy_losses_clipped), batch['masks'])
 
-        KL_penalty = masked_mean(batch['logprobs'] - episode['logprobs'], batch['masks'])
+        KL_penalty = masked_mean(episode['logprobs'] - batch['logprobs'], batch['masks'])
 
         loss = policy_loss + self.config.loss.critic_coef * critic_loss + self.config.loss.KL_coef * KL_penalty
 
@@ -1404,21 +1404,24 @@ class PPOTrainer(BasicTrainer):
                 for batch_idx, batch in enumerate(accumulated_batches):  
                     # only synchronize gradients on the last batch to avoid slowdown from unnecessary communication
                     with contextlib.nullcontext() if batch_idx + 1 == len(accumulated_batches) else self.accelerator.no_sync(self.policy):
-                        microbatch_size = len(batch['prompt_text'])
-                        global_batch_dict = self.get_global_batch_dict(batch)
-                        loss, local_batch_metrics = self.get_batch_metrics(global_batch_dict, microbatch_size, mode='train')
-                        # loss = loss / self.config.model.gradient_accumulation_steps
-
-                        for k, v in local_batch_metrics.items():
-                            batch_metrics[k].extend(v)
-
+                        batch = {k: v.to(self.accelerator.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                        loss, metrics = self.get_batch_metrics(batch)
+                        loss = loss / self.config.model.gradient_accumulation_steps
                         self.accelerator.backward(loss)
+                        delete_dicts(batch)
                     
-                v_head_norm = self.accelerator.clip_grad_norm_(self.policy.pretrained_model.parameters(), self.config.model.max_grad_norm)
-                pretrained_norm = self.accelerator.clip_grad_norm_(self.policy.v_head.parameters(), self.config.model.v_head_max_grad_norm)
+                        for k, v in metrics.items():
+                            batch_metrics[k].extend(torch.as_tensor(v).reshape(-1).float().cpu().numpy().tolist())
+
+                    self.accelerator.backward(loss)
+                    
+                pretrained_norm = self.accelerator.clip_grad_norm_(self.policy.pretrained_model.parameters(), self.config.model.max_grad_norm)
+                v_head_norm = self.accelerator.clip_grad_norm_(self.policy.v_head.parameters(), self.config.model.v_head_max_grad_norm)
                 batch_metrics['grad_norm'].extend(torch.as_tensor(v_head_norm + pretrained_norm).reshape(-1).float().cpu().numpy().tolist())
                 
                 self.optimizer.step()
+                if self.config.sync_reference or self.config.humanline:
+                    self.sync_reference_with_policy()
             
             self.scheduler.step()
             self.batch_counter += 1

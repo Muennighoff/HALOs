@@ -9,11 +9,11 @@
 #SBATCH --partition=pli-c
 #SBATCH --output=%x_%j.out
 #SBATCH --error=%x_%j.err
-#SBATCH --constraint=rh9|rh8
 
 BETA=$1
 LR=$2
 EPOCHS=$3
+GRADACC=$4
 
 # Function to find an available port
 find_free_port() {
@@ -59,7 +59,7 @@ export -f init_env
 srun --jobid=$SLURM_JOB_ID --nodes=$SLURM_JOB_NUM_NODES --ntasks-per-node=1 bash -c "
 init_env
 export MODEL_PATH=meta-llama/Meta-Llama-3-8B-Instruct
-export EXP_NAME=llama3-8B-instruct-dpo-${BETA}-${LR}-${EPOCHS}
+export EXP_NAME=llama3-8B-instruct-dpo-${BETA}-${LR}-${EPOCHS}-${GRADACC}
 export CKPT=/scratch/gpfs/ke7953/models/\$EXP_NAME/FINAL
 
 accelerate launch \
@@ -71,9 +71,9 @@ accelerate launch \
     ++cache_dir=/scratch/gpfs/ke7953/models \
     ++model.name_or_path=\$MODEL_PATH \
     ++lr=${LR} \
-    ++loss.beta=${BETA} \
-    ++humanline=false ++n_epochs=${EPOCHS} \
-    ++model.batch_size=32 ++model.gradient_accumulation_steps=1 ++model.eval_batch_size=32
+    ++loss.beta=${BETA} ++n_examples=10_000 \
+    ++humanline=false \
+    ++model.batch_size=32 ++model.gradient_accumulation_steps=${GRADACC} ++model.eval_batch_size=32
 
 # lm_eval --model hf \
 #   --model_args pretrained=\$CKPT,tokenizer=\$CKPT,parallelize=True \
