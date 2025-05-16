@@ -11,6 +11,9 @@ python -m train.label --api_type openai --api_key YOUR_KEY --api_model gpt-4 \
     --label_prompt "Rate this response's quality from 0 to 1:" \
     outputs.json reward_data.json --feedback_type binary
 
+Sample usage for verify labeling (accelerate not needed):
+python -m train.label --verify_type math outputs.json reward_data.json --feedback_type binary
+
 Sample usage for pairwise labeling of two sample files:
 python -m train.label --second_samples_path baseline_samples.json --api_type openai --api_key YOUR_KEY \
     outputs.json reward_data.json --feedback_type pairwise
@@ -224,6 +227,29 @@ async def main(args):
         )
 
         print(f"Labelled {len(processed_samples)} samples using {args.api_type} API")
+    elif args.verify_type:
+        print(f"Processing {len(samples)} samples using {args.verify_type} verification")
+        if args.verify_type == "math":
+            from simpleverify import verify_math
+            for sample in samples:
+                sample['reward'] = verify_math(
+                    sample['output'],
+                    sample['answer'],
+                    sep="</think>",
+                    na_to_zero=True,
+                )[0][0]
+                # since a dataloader isn't used, the output has to be explicitly formatted
+                sample['output'] = [{"role": "assistant", "content": sample['output']}]
+        else:
+            from simpleverify import verify_generic
+            for sample in samples:
+                sample['reward'] =  verify_generic(
+                    sample['output'],
+                    sample['answer'],
+                    sep="</think>",
+                )[0][0]
+                sample['output'] = [{"role": "assistant", "content": sample['output']}]
+        processed_samples = samples
     else:
         if accelerator.is_main_process:
             print(f"Loading reward model from {args.reward_model_path}")
@@ -317,6 +343,7 @@ if __name__ == "__main__":
     labeling_group = parser.add_mutually_exclusive_group(required=True)
     labeling_group.add_argument("--reward_model_path", type=str, help="Path to the reward model")
     labeling_group.add_argument("--api_type", type=str, choices=['openai'], help="Type of API to use for labeling")
+    labeling_group.add_argument("--verify_type", type=str, choices=['math', 'generic'], help="Type of verify func to use for labeling")
     
     # API-specific arguments
     parser.add_argument("--api_key", type=str, help="API key for the chosen API service")

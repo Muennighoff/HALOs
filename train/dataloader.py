@@ -325,6 +325,7 @@ class SFTDataLoader(DataLoader):
                         break
 
             if self.num_processes == 1 and batch != []: # flush for eval, sampling
+                example_idx += len(batch) * self.num_processes
                 yield self.collate(batch) 
                 batch = []
 

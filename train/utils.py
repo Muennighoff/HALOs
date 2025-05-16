@@ -56,7 +56,7 @@ class StreamingJSONWriter:
         """Write a single item to the JSON array."""
         if not self.is_first:
             self.file.write(',\n')
-        json.dump(item, self.file, indent=2)
+        json.dump(item, self.file, indent=2, ensure_ascii=False)
         self.is_first = False
         # Flush after each write to ensure immediate disk writing
         self.file.flush()

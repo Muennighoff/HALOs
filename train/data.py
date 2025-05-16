@@ -621,6 +621,94 @@ def get_mathstepdpo(split: str = "train") -> Dataset:
         data[key].pairs.append((0, 1))
     return data
 
+def get_deepscaler(split: str) -> Dataset:
+    if split != 'train':
+        split = 'train'
+        print(f"Warning: deepscaler only has a 'train' split but requested '{split}' split. Using 'train' split.")
+    rank0_print(f'Loading deepscaler dataset ({split} split) from Huggingface...')
+    dataset = datasets.load_dataset('agentica-org/DeepScaleR-Preview-Dataset', split=split)
+    # Deduplicate on problem
+    memory = set()
+    def is_unique(elem, column, memory):
+        if elem[column] in memory: return False
+        memory.add(elem[column])
+        return True
+    from functools import partial
+    dataset = dataset.filter(partial(is_unique, column="problem", memory=memory))
+
+    if on_rank0():
+        dataset = tqdm.tqdm(dataset, desc='Processing deepscaler')
+
+
+    data = Dataset('deepscaler')
+
+    for row in dataset:
+        # Create a unique key for this example (using the prompt)
+        key = row['problem']
+
+        # Convert the prompt into the new format
+        data[key].prompt = [{"role": "user", "content": row['problem']}]
+
+        # Update the dataset - should be run with ++frac_unique_undesirable=0.0
+        data[key].generations.append([{
+            "role": "assistant", 
+            "content": str(row['answer'])
+        }])
+        data[key].generations.append([{
+            "role": "assistant", 
+            "content": str(row['answer'])
+        }])
+        i, j = data[key].num_generations() - 2, data[key].num_generations() - 1
+        data[key].pairs.append((i, j))
+        data[key].sft_index = 0
+        data[key].dataset_name = data.name
+
+    return data
+
+def get_math(split: str) -> Dataset:
+    if split not in ('train', 'test'):
+        split = 'train'
+        print(f"Warning: math only has a 'train'/'test' split but requested '{split}' split. Using 'train' split.")
+    rank0_print(f'Loading math dataset ({split} split) from Huggingface...')
+    dataset = datasets.load_dataset('simplescaling/openaimath', split=split)
+    # Deduplicate on problem
+    memory = set()
+    def is_unique(elem, column, memory):
+        if elem[column] in memory: return False
+        memory.add(elem[column])
+        return True
+    from functools import partial
+    dataset = dataset.filter(partial(is_unique, column="problem", memory=memory))
+
+    if on_rank0():
+        dataset = tqdm.tqdm(dataset, desc='Processing math')
+
+
+    data = Dataset('math')
+
+    for row in dataset:
+        # Create a unique key for this example (using the prompt)
+        key = row['problem']
+
+        # Convert the prompt into the new format
+        data[key].prompt = [{"role": "user", "content": row['problem']}]
+
+        # Update the dataset - should be run with ++frac_unique_undesirable=0.0
+        data[key].generations.append([{
+            "role": "assistant", 
+            "content": str(row['answer'])
+        }])
+        data[key].generations.append([{
+            "role": "assistant", 
+            "content": str(row['answer'])
+        }])
+        i, j = data[key].num_generations() - 2, data[key].num_generations() - 1
+        data[key].pairs.append((i, j))
+        data[key].sft_index = 0
+        data[key].dataset_name = data.name
+
+    return data
+
 
 def get_safe_rlhf(split: str = "test") -> Dataset:
     """

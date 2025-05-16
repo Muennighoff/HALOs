@@ -275,6 +275,15 @@ class BasicTrainer(object):
                     reward_scores = outputs.score.cpu().float()
                 else:
                     reward_scores = outputs.logits[:, 1]
+        elif os.getenv('REWARDFN') is not None:
+            from simpleverify import verify_math, verify_math_cached
+            
+            # Decode the sequences using policy tokenizer
+            sequences = self.tokenizer.batch_decode(batch['target_combined_input_ids'], skip_special_tokens=True)
+            reward_scores = verify_math_cached(
+                sequences,
+                batch['answer'],
+            )
         else:
             # Use binary labels (1 for chosen, -1 for rejected)
             reward_scores = torch.tensor([(1 if batch['status'][i] == 'chosen' else -1) for i in range(len(batch['status']))])
@@ -284,7 +293,6 @@ class BasicTrainer(object):
     def train(self):
         """Begin either SFT or HALO training, with periodic evaluation. This is subclassed when implementing PPO."""
         self.accelerator.print(f'Using {self.config.optimizer} optimizer with learning rate {self.config.lr}')
-
         if self.reference_model is not None:
             self.reference_model.eval()
 
@@ -294,7 +302,7 @@ class BasicTrainer(object):
 
         for train_batch in self.train_iterator:
             # EVALUATION
-            if accumulated_batches == [] and ((self.example_counter % self.config.eval_every == 0) or (self.example_counter == 0 and self.config.do_first_eval)):
+            if accumulated_batches == [] and (((self.example_counter + 1) % self.config.eval_every == 0) or (self.example_counter == 0 and self.config.do_first_eval)):
                 results = self.eval()
 
                 if self.example_counter > 0:
@@ -315,94 +323,7 @@ class BasicTrainer(object):
 
             self.policy.train()
             start_time = time.time()
-            
-            for i in range(self.config.humanline_iters if self.config.humanline else 1):
-                self.optimizer.zero_grad()
 
-                for batch_idx, batch in enumerate(accumulated_batches):  
-                    # only synchronize gradients on the last batch to avoid slowdown from unnecessary communication
-                    with contextlib.nullcontext() if batch_idx + 1 == len(accumulated_batches) else self.accelerator.no_sync(self.policy):
-                        batch = {k: v.to(self.accelerator.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-                        loss, metrics = self.get_batch_metrics(batch)
-                        loss = loss / self.config.model.gradient_accumulation_steps
-                        self.accelerator.backward(loss)
-                    
-                        for k, v in metrics.items():
-                            batch_metrics[k].extend(torch.as_tensor(v).reshape(-1).float().cpu().numpy().tolist())
-
-                grad_norm = self.accelerator.clip_grad_norm_(self.policy.parameters(), self.config.model.max_grad_norm)
-                batch_metrics['grad_norm'].extend(torch.as_tensor(grad_norm).reshape(-1).float().cpu().numpy().tolist())
-
-                self.optimizer.step()
-                if self.config.sync_reference or self.config.humanline or self.config.online:
-                    self.sync_reference_with_policy()
-
-            self.scheduler.step()
-            step_time = time.time() - start_time
-            examples_per_second = self.config.model.batch_size / step_time
-            batch_metrics['examples_per_second'].append(examples_per_second)
-            
-            self.batch_counter += 1
-            self.example_counter += self.config.model.batch_size
-
-            if last_log is None or time.time() - last_log > self.config.minimum_log_interval_secs:
-                mean_train_metrics = {}
-                for k, v in batch_metrics.items():
-                    if len(v) > 0:
-                        mean_train_metrics[k] = sum(v) / len(v)
-
-                mean_train_metrics['counters/examples'] = self.example_counter
-                mean_train_metrics['counters/updates'] = self.batch_counter
-                mean_train_metrics['counters/lr'] = self.scheduler.get_last_lr()[0]
-                self.accelerator.print(f'train stats after {self.batch_counter} steps: {formatted_dict(mean_train_metrics)}')
-
-                if self.config.wandb.enabled and self.accelerator.is_main_process:
-                    wandb.log(mean_train_metrics, step=self.example_counter)
-
-                last_log = time.time()
-                batch_metrics = defaultdict(list)
-            else:
-                self.accelerator.print(f'skipping logging after {self.example_counter} examples to avoid logging too frequently')
-
-            delete_dicts(metrics, batch_metrics, mean_train_metrics)
-            accumulated_batches = []
-            self.free_memory()
-
-    def train(self):
-        """Begin either SFT or HALO training, with periodic evaluation. This is subclassed when implementing PPO."""
-        self.accelerator.print(f'Using {self.config.optimizer} optimizer with learning rate {self.config.lr}')
-
-        if self.reference_model is not None:
-            self.reference_model.eval()
-
-        last_log = None
-        batch_metrics = defaultdict(list)
-        accumulated_batches = []
-
-        for train_batch in self.train_iterator:
-            # EVALUATION
-            if accumulated_batches == [] and ((self.example_counter % self.config.eval_every == 0) or (self.example_counter == 0 and self.config.do_first_eval)):
-                results = self.eval()
-
-                if self.config.debug:
-                    self.accelerator.print('skipping save in debug mode')
-                elif self.config.intermediate_checkpoints:
-                    output_dir = os.path.join(self.run_dir, f'step-{self.example_counter}')
-                    self.accelerator.print(f'creating checkpoint to write to {output_dir}...')
-                    self.save(output_dir, results['results'], final_save=False)
-
-            if results is not None:
-                self.accelerator.print(results['results'])
-                delete_dicts(results) 
-            
-            # TRAINING
-            accumulated_batches.append(train_batch)
-            if len(accumulated_batches) < self.config.model.gradient_accumulation_steps:
-                continue
-
-            self.policy.train()
-            start_time = time.time()
-            
             for i in range(self.config.humanline_iters if self.config.humanline else 1):
                 self.optimizer.zero_grad()
 
@@ -750,7 +671,7 @@ class UnpairedPreferenceTrainer(BasicTrainer):
         if self.reference_model:
             del reference_chosen_logps, reference_rejected_logps
 
-        return losses.sum(), metrics
+        return losses.mean(), metrics
 
 
 class PairedPreferenceTrainer(BasicTrainer):
@@ -840,7 +761,7 @@ class PairedPreferenceTrainer(BasicTrainer):
         if self.reference_model:
             del reference_chosen_logps, reference_rejected_logps
 
-        return losses.sum(), metrics
+        return losses.mean(), metrics
 
 
 class DPOTrainer(PairedPreferenceTrainer):
@@ -1092,7 +1013,7 @@ class KTOTrainer(UnpairedPreferenceTrainer):
         del policy_chosen_logps, policy_rejected_logps, policy_KL_logps, reference_chosen_logps, reference_rejected_logps, reference_KL_logps
         del combined_rewards, combined_statuses, all_rewards, all_statuses, chosen_rewards_idx, rejected_rewards_idx, all_KL
 
-        return losses.sum(), metrics
+        return losses.mean(), metrics
 
 
 class GRPOTrainer(BasicTrainer):
@@ -1117,7 +1038,7 @@ class GRPOTrainer(BasicTrainer):
             group_size = group_size.unsqueeze(-1)
 
         weighted_adv = advantages * ratio
-        weighted_adv_clipped =  advantages * ratio.clamp(1 - self.config.loss.epsilon, 1 + self.config.loss.epsilon)
+        weighted_adv_clipped = advantages * ratio.clamp(1 - self.config.loss.epsilon, 1 + self.config.loss.epsilon)
         losses = -1 * (torch.min(weighted_adv, weighted_adv_clipped) - self.config.loss.beta * KL) / group_size
 
         return losses, KL.detach(), weighted_adv.detach()
@@ -1166,7 +1087,8 @@ class GRPOTrainer(BasicTrainer):
 
         for i, prompt_id in enumerate(batch['prompt_id']):
             group_size.append(len(scores_by_prompt_id[prompt_id]))
-            advantages.append((batch['score'][i] - np.mean(scores_by_prompt_id[prompt_id])) / np.std(scores_by_prompt_id[prompt_id]))
+            # add small epsilon to avoid division by zero
+            advantages.append((batch['score'][i] - np.mean(scores_by_prompt_id[prompt_id])) / (np.std(scores_by_prompt_id[prompt_id]) + 1e-4))
 
         advantages = torch.Tensor(advantages).to(self.accelerator.device)
         group_size = torch.Tensor(group_size).to(self.accelerator.device)
@@ -1185,8 +1107,8 @@ class GRPOTrainer(BasicTrainer):
         metrics[f'loss/{mode}'] = self.accelerator.gather(losses.detach()).mean()
         
         del policy_logps, reference_logps, scores, prompt_ids, advantages, group_size, KL, weighted_advantage
-        
-        return losses.sum(), metrics
+
+        return losses.mean(), metrics
 
 
 class PPOTrainer(BasicTrainer):
@@ -1485,7 +1407,7 @@ class PPOTrainer(BasicTrainer):
                         microbatch_size = len(batch['prompt_text'])
                         global_batch_dict = self.get_global_batch_dict(batch)
                         loss, local_batch_metrics = self.get_batch_metrics(global_batch_dict, microbatch_size, mode='train')
-                        loss = loss / self.config.model.gradient_accumulation_steps
+                        # loss = loss / self.config.model.gradient_accumulation_steps
 
                         for k, v in local_batch_metrics.items():
                             batch_metrics[k].extend(v)
@@ -1712,4 +1634,4 @@ class BradleyTerryTrainer(PairedPreferenceTrainer):
         metrics[f'rewards_{mode}/margins'] = self.accelerator.gather((chosen_rewards - rejected_rewards).detach())
         metrics[f'loss/{mode}'] = self.accelerator.gather(losses.detach()).mean()
 
-        return losses.sum(), metrics
+        return losses.mean(), metrics
