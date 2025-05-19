@@ -59,7 +59,7 @@ def validate_datasets(datasets):
 def main(args):
     validate_datasets(args.datasets)
     set_offline_if_needed()
-
+    
     # Load the model and tokenizer
     print(f"Loading model and tokenizer from {args.model_path}")
     llm = LLM(model=args.model_path, tensor_parallel_size=args.gpu_count)
@@ -67,7 +67,7 @@ def main(args):
     tokenizer.chat_template = open('config/template.jinja').read()
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
-
+    
     sampling_params = SamplingParams(
         temperature=args.temperature,
         top_p=args.top_p,
@@ -75,6 +75,8 @@ def main(args):
         stop=[args.stop_token],
         n=args.num_samples_per_prompt
     )
+
+    prompt_idx = 0
 
     # Open the output file and create a streaming writer
     with open(args.output_file, 'w') as f:
@@ -93,68 +95,33 @@ def main(args):
             num_skip=args.num_skip,
         )
         
-        # Collect all prompts, original prompts, and dataset names
-        all_prompt_texts = []
-        all_original_prompts = []
-        all_dataset_names = []
-        all_targets = []
-        
-        print("Collecting all prompts...")
+        # Process the dataset in batches
         for batch in dataloader:
-            all_prompt_texts.extend(batch['prompt_text'])
-            all_original_prompts.extend(batch['prompt'])
-            all_dataset_names.extend(batch['dataset_name'])
-            if "target" in batch:
-                all_targets.extend(batch['target'])
-            else:
-                all_targets.extend([None] * len(batch['prompt_text']))
-        
-        # Generate all responses at once; around 4x faster than generating per batch (39.84 toks/s -> 138.40 toks/s)
-        print(f"Generating responses for {len(all_prompt_texts)} prompts...")
-        all_responses = llm.generate(all_prompt_texts, sampling_params)
-        # Filter out all responses where model generated too many tokens
-        import pdb; pdb.set_trace()
-        group_size = 8
-        filtered_respsonses = [
-            r for r in all_responses if all([o.finish_reason != "length" for o in r.outputs])
-        ]
+            # prompt_text has already had the chat template applied
+            responses = llm.generate(batch['prompt_text'], sampling_params)
 
+            # Process and write each output
+            for prompt, response, dataset_name in zip(batch['prompt'], responses, batch['dataset_name']):
+                for sample_idx, sample in enumerate(response.outputs):
+                    output = {
+                        "output": re.sub(r"<?\|(im_start|im_end)\|>?", "", sample.text.strip()),
+                        "generator": args.model_path,
+                        "dataset": f"{dataset_name}_{args.split}",
+                        "prompt_id": prompt_idx,
+                        "sample_id": sample_idx,
+                        "type": "sample",
+                    }
 
+                    # for eval with alpacaeval
+                    if args.mode == "alpacaeval":
+                        output["instruction"] = prompt[0]["content"]
+                    else:
+                        output["prompt"] = prompt
 
-        for i in range(0, len(all_responses), group_size):
-            group = all_responses[i:i + group_size]
-            # filtered_group = [r for r in group if len(r.outputs) > 0 and len(r.outputs[0].text) < args.max_tokens]
-            # filtered_respsonses.extend(filtered_group)
-            # Use Stop reason instead
-            filtered_group = [r for r in group if r.outputs[0].finish_reason != "length"]
-            if len(filtered_group) != len(group): continue
-            filtered_respsonses.extend(filtered_group)
-        all_responses = filtered_respsonses
-        print(f"Generated {len(all_responses)} valid responses.")
-        
-        # Process and write each output
-        for prompt_idx, (prompt, response, dataset_name, target) in enumerate(
-            zip(all_original_prompts, all_responses, all_dataset_names, all_targets)
-        ):
-            for sample_idx, sample in enumerate(response.outputs):
-                output = {
-                    "output": re.sub(r"<?\|(im_start|im_end)\|>?", "", sample.text.strip()),
-                    "generator": args.model_path,
-                    "dataset": f"{dataset_name}_{args.split}",
-                    "prompt_id": prompt_idx,
-                    "sample_id": sample_idx,
-                    "type": "sample",
-                    "answer": target[0]['content'] if target else None,
-                }
+                    writer.write_item(output)
 
-                # for eval with alpacaeval
-                if args.mode == "alpacaeval":
-                    output["instruction"] = prompt[0]["content"]
-                else:
-                    output["prompt"] = prompt
+                prompt_idx += 1
 
-                writer.write_item(output)
-        
         writer.close()
 
     destroy_model_parallel()

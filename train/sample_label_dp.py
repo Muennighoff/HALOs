@@ -2,6 +2,7 @@ import argparse
 import re
 import sys
 import inspect
+from typing import List
 from vllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 from .dataloader import SFTDataLoader
@@ -35,6 +36,44 @@ def validate_datasets(datasets):
             f"Currently available datasets are:\n- {available_str}"
         )
 
+def undistribute(iterable):
+    """
+    Undoes https://more-itertools.readthedocs.io/en/stable/api.html#more_itertools.distribute .
+
+    Re-interleaves results that have been split using more_itertools.distribute:
+        >>> group_1, group_2 = distribute(2, [1, 2, 3, 4, 5, 6])
+        >>> list(group_1)
+        [1, 3, 5]
+        >>> list(group_2)
+        [2, 4, 6]
+        >>> undistribute([group_1, group_2])
+        [1, 2, 3, 4, 5, 6]
+
+    Handles non-uniform component lengths:
+
+        >>> children = distribute(3, [1, 2, 3, 4, 5, 6, 7])
+        >>> [list(c) for c in children]
+        [[1, 4, 7], [2, 5], [3, 6]]
+        >>> undistribute(children)
+        [1, 2, 3, 4, 5, 6, 7]
+
+    Also handles when some iterables are empty:
+
+        >>> children = distribute(5, [1, 2, 3])
+        >>> [list(c) for c in children]
+        [[1], [2], [3], [], []]
+        >>> undistribute(children)
+        [1, 2, 3]
+
+    """
+    import itertools
+    return [
+        x
+        for x in itertools.chain.from_iterable(
+            itertools.zip_longest(*[list(x) for x in iterable])
+        )
+        if x is not None
+    ]
 
 def main(args):
     validate_datasets(args.datasets)
@@ -42,7 +81,11 @@ def main(args):
 
     # Load the model and tokenizer
     print(f"Loading model and tokenizer from {args.model_path}")
-    llm = LLM(model=args.model_path, tensor_parallel_size=args.gpu_count)
+    if args.engine == "vllm":
+        llm = LLM(model=args.model_path, tensor_parallel_size=args.tp)
+    elif args.engine == "sgl":
+        import sglang as sgl
+        llm = sgl.Engine(model_path=args.model_path, tp_size=args.tp, dp_size=args.dp)#, mem_fraction_static=0.7)
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     # tokenizer.chat_template = open('config/template.jinja').read()
     if tokenizer.pad_token_id is None:
@@ -94,64 +137,120 @@ def main(args):
                 else:
                     all_targets.extend([None] * len(batch['prompt_text']))
 
-            new_prompts, new_original_prompts, new_dataset_names, new_targets = [], [], [], []
-            for prompt, original_prompt, dataset_name, target in zip(all_prompt_texts, all_original_prompts, all_dataset_names, all_targets):
-                if prompt in prompts_set: continue
-                prompts_set.add(prompt)
-                new_prompts.append(prompt)
-                new_original_prompts.append(original_prompt)
-                new_dataset_names.append(dataset_name)
-                new_targets.append(target)
-            print(f"Removed {len(all_prompt_texts) - len(new_prompts)} duplicates.")
-            all_prompt_texts, all_original_prompts, all_dataset_names, all_targets = new_prompts, new_original_prompts, new_dataset_names, new_targets
 
+            unique_prompts = set(all_prompt_texts)
+            num_dups = len(all_prompt_texts) - len(unique_prompts)
+            if num_dups > 0:
+                print(f"Found {num_dups} duplicate prompts. Removing...")
+                new_prompts, new_original_prompts, new_dataset_names, new_targets = [], [], [], []
+                for prompt, original_prompt, dataset_name, target in zip(all_prompt_texts, all_original_prompts, all_dataset_names, all_targets):
+                    if prompt not in unique_prompts: continue
+                    unique_prompts.remove(prompt)
+                    new_prompts.append(prompt)
+                    new_original_prompts.append(original_prompt)
+                    new_dataset_names.append(dataset_name)
+                    new_targets.append(target)
+                all_prompt_texts, all_original_prompts, all_dataset_names, all_targets = new_prompts, new_original_prompts, new_dataset_names, new_targets
+
+
+            print(f"Num duplicates: {len(all_prompt_texts) - len(set(all_prompt_texts))}")
             # Generate all responses at once; around 4x faster than generating per batch (39.84 toks/s -> 138.40 toks/s)
             print(f"Generating responses for {len(all_prompt_texts)} prompts...")
-            # 31:50 min for 12K MATH questions with 4096 seq len
-            all_responses = llm.generate(all_prompt_texts, sampling_params)
-            # Filter out responses that are too long; filters 12K -> 10966 for MATH; Done in loop now instead
-            # all_responses = [r for r in all_responses if all([o.finish_reason != "length" for o in r.outputs])]
-            # print(f"Left with {len(all_responses)} responses that are not too long.")
+            if args.engine == "vllm":
+                if args.dp > 1:
+                    import ray
+                    from more_itertools import distribute
+                    # vLLM hangs if resources are set in ray.remote
+                    # also seems to only work with decorator and not with ray.remote() fn
+                    # see https://github.com/vllm-project/vllm/issues/973
+                    @ray.remote
+                    def run_inference_one_model(
+                        model_args: dict,
+                        sampling_params: SamplingParams,
+                        requests: List[List[int]],
+                    ):
+                        llm = LLM(**model_args)
+                        return llm.generate(
+                            prompt_token_ids=requests,
+                            sampling_params=sampling_params,
+                        )
+                    # dispatch requests to all self.data_parallel_size workers, in interleaved fashion
+                    # interleaved important to balance context lengths across workers
+                    requests = [list(x) for x in distribute(args.dp, all_prompt_texts)]
+                    inputs = (
+                        (
+                            dict(model=args.model_path, tensor_parallel_size=args.tp, distributed_executor_backend="ray"),
+                            sampling_params,
+                            req,
+                        )
+                        for req in requests
+                    )
+                    object_refs = [run_inference_one_model.remote(*x) for x in inputs]
+                    results = ray.get(object_refs)
+                    # Invoke ray.shutdown() to prevent hang-ups if subsequent calls required.
+                    ray.shutdown()
+                    # flatten results
+                    all_responses = undistribute(results)
+                else:
+                    # 31:50 min for 12K MATH questions with 4096 seq len
+                    all_responses = llm.generate(all_prompt_texts, sampling_params)
+                    # Filter out responses that are too long; filters 12K -> 10966 for MATH; Done in loop now instead
+                    # all_responses = [r for r in all_responses if all([o.finish_reason != "length" for o in r.outputs])]
+                    # print(f"Left with {len(all_responses)} responses that are not too long.")
+            elif args.engine == "sgl":
+                # SGL engine
+                all_responses = llm.generate(
+                    all_prompt_texts, 
+                    sampling_params={
+                    "temperature": args.temperature,
+                    "top_p": args.top_p,
+                    "max_new_tokens": args.max_tokens,
+                    "stop": [args.stop_token],
+                    "n": args.num_samples_per_prompt,
+                })
+                all_responses = [all_responses[i:i + args.num_samples_per_prompt] for i in range(0, len(all_responses), args.num_samples_per_prompt)]
 
-            acc = []
-            skipped_len = 0
-            skipped_verify = 0
+            # acc = []
+            skipped_len, skipped_verify, skipped_dup = 0, 0, 0
             # Process and write each output
             for prompt_idx, (prompt, response, dataset_name, target) in enumerate(
                 zip(all_original_prompts, all_responses, all_dataset_names, all_targets)
             ):
-                if any([o.finish_reason == "length" for o in response.outputs]):
+                if (args.engine == "vllm" and any([o.finish_reason == "length" for o in response.outputs])) or \
+                   (args.engine == "sgl" and any([o['meta_info']['finish_reason'] == "length" for o in response])):
                     skipped_len += 1
                     continue
+                if prompt in prompts_set:
+                    skipped_dup += 1
+                    continue
+                prompts_set.add(prompt)
+                txts = [o.text for o in response.outputs] if args.engine == "vllm" else [o['text'] for o in response]
                 if args.verifyfn == "math":
                     rewards = [r[0] for r in verify_math_cached(
-                        [r.text for r in response.outputs],
+                        txts,
                         target[0]['content'],
                         sep="</think>",
                         na_to_zero=True,
                     )]
-                    # rewards = [verify_math_cached([r.outputs[0].text], t[0]['content'], sep="</think>", na_to_zero=True)[0] for r,t in zip(all_responses_1_l, all_targets)]
-
                 elif args.verifyfn == "generic":
                     rewards = [r[0] for r in verify_generic_cached(
-                        [r.text for r in response.outputs],
+                        txts,
                         target[0]['content'],
                         sep="</think>",
                         na_to_zero=True,
                     )]
-                    # print(rewards)
-                    # import pdb; pdb.set_trace()
+                # print(rewards)
+                # import pdb; pdb.set_trace()
                 # Skip if all rewards are the same as no signal in GRPO
                 # Filters 12K -> 7089 for MATH
                 # acc.append(rewards)
                 if len(set(rewards)) == 1:
                     skipped_verify += 1
                     continue
-                # print(rewards)
-                for sample_idx, sample in enumerate(response.outputs):
+                iterate = response.outputs if args.engine == "vllm" else response
+                for sample_idx, sample in enumerate(iterate):
                     output = {
                         "prompt": prompt,
-                        "output": [{"role": "assistant", "content": re.sub(r"<?\|(im_start|im_end)\|>?", "", sample.text.strip())}],
                         "generator": args.model_path,
                         "dataset": f"{dataset_name}_{args.split}",
                         "prompt_id": args.num_prompts - prompts_left,
@@ -161,6 +260,10 @@ def main(args):
                         "label": rewards[sample_idx],
                         "reward": rewards[sample_idx],
                     }
+                    if args.engine == "vllm":
+                        output["output"] = [{"role": "assistant", "content": re.sub(r"<?\|(im_start|im_end)\|>?", "", sample.text.strip())}]
+                    elif args.engine == "sgl":
+                        output["output"] = [{"role": "assistant", "content": re.sub(r"<?\|(im_start|im_end)\|>?", "", sample['text'].strip())}]
                     writer.write_item(output)
                 prompts_left -= 1
                 if prompts_left == 0: break
@@ -171,35 +274,8 @@ def main(args):
             if prompts_left == 0: break
         writer.close()
 
-    # print("Accuracy:", sum(acc) / len(acc))
-    # [x for x in acc if sum(x) not in (0, len(x))]
-    # import pdb; pdb.set_trace()
-    # llm.engine.shutdown()
     destroy_model_parallel()
     destroy_distributed_environment()
-    # del llm
-    # import gc
-    # gc.collect()
-    # import torch
-    # torch.cuda.empty_cache()
-    # import pdb; pdb.set_trace()
-    # import os
-    # os._exit(0)
-
-    # sys.exit(0)
-
-    # import gc
-    # import contextlib
-    # import ray
-    # import torch
-    # del llm
-    # with contextlib.suppress(AssertionError):
-    #     torch.distributed.destroy_process_group()
-    # gc.collect()
-    # torch.cuda.empty_cache()
-    # ray.shutdown()
-
-    print("NUMSKIP=", num_skip) # Capture for future runs
 
 
 if __name__ == "__main__":
@@ -208,7 +284,6 @@ if __name__ == "__main__":
     parser.add_argument("--datasets", nargs="+", default=["alpacaeval"], help="List of datasets to sample from (space-separated)")
     parser.add_argument("--verifyfn", type=str, default="math", help="math/generic")    
     parser.add_argument("--output_file", type=str, default="outputs.json", help="Path to save the output JSON file")
-    parser.add_argument("--gpu_count", type=int, default=1, help="Number of GPUs to use")
     parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
     parser.add_argument("--top_p", type=float, default=1.0, help="Top-p sampling parameter")
     parser.add_argument("--max_tokens", type=int, default=2048, help="Maximum number of tokens to generate")
@@ -223,11 +298,9 @@ if __name__ == "__main__":
     parser.add_argument("--oversample", type=float, default=None, help="oversample in first round of generation to speed things up")
     parser.add_argument("--num_skip", type=int, default=0, help="number of prompts to skip at the beginning")
     parser.add_argument("--num_epochs", type=int, default=None, help="number of times to pass through the data (in order)")
+    parser.add_argument("--tp", type=int, default=1, help="Number of tensor parallel gpus")
+    parser.add_argument("--dp", type=int, default=1, help="number of data parallel workers to use; sometimes hangs")
+    parser.add_argument("--engine", type=str, default="vllm", help="vllm/sgl")
 
     args = parser.parse_args()
     main(args)
-
-# Upgrade vLLM?
-# Check eval with same seq len; maybe increase seq len
-
-# 3235 (25880/25880) -> Left with 2949 responses that are not too long; losing ~10%
