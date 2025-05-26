@@ -133,51 +133,22 @@ class BasicTrainer(object):
 
         return per_token_logps * loss_mask
     
-    def get_humanline_mask(self, policy_logps, reference_logps):
-        """
-        Return a boolean mask over tokens, where True means that the token has been rejected under humanline sampling.
-
-        Args:
-            policy_logps: token-level probabilities according to policy (microbatch_size, maximum sequence length)
-            reference_logps: token-level probabilities according to reference model (microbatch_size, maximum sequence length)
-
-        Returns:
-            The rejection mask (microbatch_size, sequence length)
-        """
-        forward_rv = torch.distributions.beta.Beta(self.config.humanline_gamma_R, self.config.humanline_beta_R)
-        forward_M = (reference_logps - policy_logps).exp().max().item()
-        forward_sample = forward_rv.sample(policy_logps.shape).to(self.accelerator.device)
-        forward_token_mask = (reference_logps - policy_logps).exp() < forward_M * forward_sample
-
-        backward_rv = torch.distributions.beta.Beta(self.config.humanline_gamma_P, self.config.humanline_beta_P)
-        backward_sample = backward_rv.sample(policy_logps.shape).to(self.accelerator.device)
-        backward_M = (policy_logps - reference_logps).exp().max().item()
-        backward_token_mask = (policy_logps - reference_logps).exp() < backward_M * backward_sample
-
-        humanline_mask = forward_token_mask | backward_token_mask
-        
-        return humanline_mask
-    
-    def get_ratios(self, policy_logps, reference_logps, sequence_level=False):
+    def get_ratios(self, policy_logps, reference_logps):
         """
         Return the probability ratio under the policy vs the reference [policy(y|x)/reference(y|x)].
-        Apply humanline sampling if specified.
+        Apply humanline if specified.
 
         Args:
             policy_logps: token-level probabilities according to policy (microbatch_size, maximum sequence length)
             reference_logps: token-level probabilities according to reference model (microbatch_size, maximum sequence length)
-            sequence_level: if true, return the probability for the entire sequence; otherwise, per-token
 
         Returns:
             The probability ratios (microbatch_size, sequence length) if sequence_level; otherwise, (microbatch_size, 1)
         """
-        logratio = policy_logps - reference_logps
-
         if self.config.humanline:
-            logratio = torch.where(self.get_humanline_mask(policy_logps, reference_logps), logratio.detach(), logratio)
-
-        if sequence_level:
-            logratio = logratio.sum(-1)
+            logratio = (policy_logps - reference_logps).clamp(self.config.log_epsilon_P, self.config.log_epsilon_R)
+        else:
+            logratio = policy_logps - reference_logps
 
         ratio = logratio.exp()
 
@@ -186,10 +157,6 @@ class BasicTrainer(object):
     def get_sequence_rewards(self, policy_logps, reference_logps, length_normalized=False):
         """
         If regular alignment, return the HALO-defined reward for the sequence (log [policy(y|x)/reference(y|x)]).
-
-        For humanline alignment, do zero-shot rejection sampling. Assume that the examples are drawn from the 
-        reference model, zero-out the tokens that don't meet the rejection sampling criterion, then sum over what 
-        remains to get the sequence-level rewards.
         
         Args:
             policy_logps: token-level probabilities according to policy (microbatch_size, maximum sequence length)
@@ -199,8 +166,10 @@ class BasicTrainer(object):
         Returns:
             The sequence-level rewards (microbatch_size, 1).
         """
-        mask = self.get_humanline_mask(policy_logps, reference_logps) if self.config.humanline else torch.zeros_like(policy_logps).bool()
-        token_rewards = torch.where(mask, (policy_logps - reference_logps).detach(), policy_logps - reference_logps)
+        if self.config.humanline:
+            token_rewards = (policy_logps - reference_logps).clamp(self.config.log_epsilon_P, self.config.log_epsilon_R)
+        else:
+            token_rewards = policy_logps - reference_logps
         
         normalization_factor = (token_rewards.abs() != 0).float().sum(-1) if length_normalized else 1
         sequence_rewards = token_rewards.sum(-1) / normalization_factor
@@ -340,9 +309,10 @@ class BasicTrainer(object):
                 grad_norm = self.accelerator.clip_grad_norm_(self.policy.parameters(), self.config.model.max_grad_norm)
                 batch_metrics['grad_norm'].extend(torch.as_tensor(grad_norm).reshape(-1).float().cpu().numpy().tolist())
 
-                self.optimizer.step()
-                if self.config.sync_reference or self.config.humanline:
+                if self.config.loss.sync_reference or self.config.humanline:
                     self.sync_reference_with_policy()
+                    
+                self.optimizer.step()
 
             self.scheduler.step()
             step_time = time.time() - start_time
@@ -555,52 +525,6 @@ class SFTTrainer(BasicTrainer):
         # Gather losses and logps from all processes
         metrics[f'logps/{mode}'] = self.accelerator.gather((policy_chosen_logps * token_mask).detach().sum() / token_mask.sum())
         metrics[f'loss/{mode}'] = self.accelerator.gather(normalized_loss.detach())
-
-        return normalized_loss.sum(), metrics
-
-
-class HumanlineSFTTrainer(BasicTrainer):
-    use_reference_model = True
-
-    def get_batch_metrics(self, batch: Dict[str, Union[List, torch.LongTensor]], mode: str='train'):
-        """Compute the loss and other metrics for the given batch of inputs.
-        
-        Args:
-            batch: dictionary of inputs for the batch (should contain 'target_attention_mask', 'target_input_input_ids', 
-                'target_labels' where 'target' corresponds to the SFT example)
-            mode: one of 'train', 'eval', 'sample'
-        """
-        metrics = {}
-        
-        with self.accelerator.autocast():
-            policy_chosen_logits = self.policy(
-                batch['target_combined_input_ids'], 
-                attention_mask=batch['target_combined_attention_mask'],
-            ).logits.to(self.policy_dtype)
-            
-            policy_chosen_logps = self.get_batch_logps(policy_chosen_logits, batch['target_labels'])
-            policy_chosen_logps = policy_chosen_logps.view(-1)
-            token_mask = (policy_chosen_logps != 0).float().detach()
-
-            with torch.no_grad():
-                reference_chosen_logits = self.reference_model(
-                    batch['target_combined_input_ids'], 
-                    attention_mask=batch['target_combined_attention_mask'],
-                ).logits.to(self.policy_dtype)
-                
-                reference_chosen_logps = self.get_batch_logps(reference_chosen_logits, batch['target_labels'])
-                reference_chosen_logps = reference_chosen_logps.view(-1)
-
-            humanline_mask = self.get_humanline_mask(policy_chosen_logps, reference_chosen_logps)
-            normalized_loss = torch.where(humanline_mask, -policy_chosen_logps.detach(), -policy_chosen_logps) / token_mask.sum()
-
-        # Gather losses and logps from all processes
-        metrics[f'unmasked/{mode}'] = ((1 - humanline_mask.float()) * token_mask).sum() / token_mask.sum()
-        metrics[f'tokens/{mode}'] = self.accelerator.gather(token_mask.sum()).sum()
-        metrics[f'logps/{mode}'] = self.accelerator.gather((policy_chosen_logps * token_mask).detach().sum() / token_mask.sum())
-        metrics[f'loss/{mode}'] = self.accelerator.gather(normalized_loss.detach())
-
-        del policy_chosen_logits, policy_chosen_logps, reference_chosen_logits, reference_chosen_logps, humanline_mask, token_mask
 
         return normalized_loss.sum(), metrics
 
@@ -1027,20 +951,20 @@ class GRPOTrainer(BasicTrainer):
             group_size: number of outputs (in entire batch) belonging to prompt associated with sequence (microbatch_size,)
 
         Returns:
-            sequence-level losses (microbatch_size,), sequence-level KL (microbatch_size,), weighted advantages (microbatch_size,)
+            average loss, average KL, average weighted advantage
         """
-        ratio = self.get_ratios(policy_logps, reference_logps, sequence_level=self.config.loss.sequence_level)
-        KL = (-ratio.log()).exp() + ratio.log() - 1
+        ratio = self.get_ratios(policy_logps, reference_logps)
+        masks = (batch['target_labels'][:, 1:] != -100).clone().to(self.policy_dtype)
 
-        if not self.config.loss.sequence_level:
-            advantages = advantages.unsqueeze(-1)
-            group_size = group_size.unsqueeze(-1)
+        advantages = advantages.unsqueeze(-1)
+        group_size = group_size.unsqueeze(-1)
 
         weighted_adv = advantages * ratio
         weighted_adv_clipped = advantages * ratio.clamp(1 - self.config.loss.epsilon, 1 + self.config.loss.epsilon)
-        losses = -1 * (torch.min(weighted_adv, weighted_adv_clipped) - self.config.loss.beta * KL) / group_size
+        per_token_KL = torch.exp(reference_logps - policy_logps) - (reference_logps - policy_logps) - 1
+        per_token_loss = -torch.min(weighted_adv, weighted_adv_clipped) + self.config.loss.beta * per_token_KL
 
-        return losses, KL.detach(), weighted_adv.detach()
+        return masked_mean(per_token_loss, masks, axis=-1), masked_mean(per_token_KL.detach(), masks, axis=-1), masked_mean(weighted_adv.detach(), masks, axis=-1)
 
     def forward(self, model: nn.Module, batch: Dict[str, Union[List, torch.LongTensor]], use_cache: bool=False) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
         """Run the given model on the given batch of inputs.
@@ -1420,7 +1344,7 @@ class PPOTrainer(BasicTrainer):
                 batch_metrics['grad_norm'].extend(torch.as_tensor(v_head_norm + pretrained_norm).reshape(-1).float().cpu().numpy().tolist())
                 
                 self.optimizer.step()
-                if self.config.sync_reference or self.config.humanline:
+                if self.config.loss.sync_reference or self.config.humanline:
                     self.sync_reference_with_policy()
             
             self.scheduler.step()
